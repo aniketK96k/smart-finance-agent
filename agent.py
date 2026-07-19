@@ -6,8 +6,9 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, BaseMessage
-from mcpC.mcpclient import get_alpaca_tools
+from MCP.mcpclient import get_alpaca_tools
 from sanitizerGemini.gemini_schema_patch import sanitize_tools_for_gemini
+from MCP.trade_tool import build_trade_tools
 from sql.sqlDB import sql_tools
 from dotenv import load_dotenv
 import os
@@ -27,6 +28,11 @@ def load_alpaca_tools():
 
 
 ALPACATools = load_alpaca_tools()
+
+TRADE_TOOLS = build_trade_tools(ALPACATools)
+EXCLUDED_FOR_LLM = {"place_stock_order", "place_crypto_order", "place_option_order"}
+alpaca_readonly_raw = [t for t in ALPACATools if t.name not in EXCLUDED_FOR_LLM]
+ALPACA_READONLY = sanitize_tools_for_gemini(alpaca_readonly_raw)
 
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
@@ -78,7 +84,7 @@ def rag_tool(query: str):
     return {"docs": ["Q2 report", "CEO notes"]}
 
 
-tools = [erp_tool] + ALPACATools + sql_tools
+tools = [erp_tool]  + sql_tools+ALPACA_READONLY+TRADE_TOOLS
 
 
 
