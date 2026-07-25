@@ -4,6 +4,8 @@ import asyncio
 import copy
 from langchain_core.tools import tool
 
+from sql.risk import check_position_risk
+
 DB_PATH = "F:/GenAi/ProjectFInancial/data/finance.db"
 
 
@@ -152,12 +154,20 @@ def build_trade_tools(alpaca_tools):
     get_order = _get_alpaca_tool(alpaca_tools, "get_order_by_id")
 
     @tool
-    async def buy_or_sell_stock(symbol: str, side: str, quantity: float) -> dict:
+    async def buy_or_sell_stock(symbol: str, side: str, quantity: float,
+                                 sector: str | None = None, force: bool = False) -> dict:
         """
         Place a market buy or sell order for a stock via Alpaca and record it
         in the local wallet/holdings/ledger tables if it fills immediately.
         side must be 'buy' or 'sell'. Always use this tool for trading —
         never call place_stock_order directly.
+
+        Before a BUY, if the position or sector risk limits would be
+        breached, this returns status "needs_confirmation" instead of
+        placing the order. Only set force=True after the user has
+        explicitly confirmed proceeding — phrases like "yes", "proceed
+        anyway", "confirm", "do it" following a needs_confirmation
+        response all count as confirmation.
 
         If the order does not fill right away (e.g. market closed), it is
         queued for automatic reconciliation — the local wallet is NOT touched
@@ -170,6 +180,23 @@ def build_trade_tools(alpaca_tools):
 
         symbol = symbol.upper().strip()
 
+        if side == "buy" and not force:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT avg_price FROM holdings WHERE symbol = ?", (symbol,))
+            row = cursor.fetchone()
+            conn.close()
+            est_price = row[0] if row else None
+
+            if est_price:
+                risk_check = check_position_risk(symbol, quantity * est_price, sector)
+                if not risk_check["approved"]:
+                    return {
+                        "status": "needs_confirmation",
+                        "flags": risk_check["flags"],
+                        "message": "This trade breaches your risk limits. Confirm to proceed anyway.",
+                    }
+
         order = await place_order.ainvoke({
             "symbol": symbol,
             "side": side,
@@ -177,6 +204,7 @@ def build_trade_tools(alpaca_tools):
             "type": "market",
             "time_in_force": "day",
         })
+        # ... rest unchanged
 
         fill_price = _extract_field(order, "filled_avg_price")
         order_id = _extract_field(order, "id", "order_id")

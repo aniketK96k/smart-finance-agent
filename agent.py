@@ -15,6 +15,7 @@ import os
 import asyncio
 import streamlit as st
 import nest_asyncio
+from sql.risk import get_portfolio_diversification
 
 nest_asyncio.apply()
 
@@ -83,8 +84,9 @@ def rag_tool(query: str):
     """Fetch company documents"""
     return {"docs": ["Q2 report", "CEO notes"]}
 
+RISK_TOOLS = sanitize_tools_for_gemini([get_portfolio_diversification])
+tools = [erp_tool] + sql_tools + ALPACA_READONLY + TRADE_TOOLS + RISK_TOOLS
 
-tools = [erp_tool]  + sql_tools+ALPACA_READONLY+TRADE_TOOLS
 
 
 
