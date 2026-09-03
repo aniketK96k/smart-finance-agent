@@ -5,7 +5,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, BaseMessage
+from langchain_core.messages import HumanMessage, BaseMessage,SystemMessage
 from MCP.mcpclient import get_alpaca_tools
 from sanitizerGemini.gemini_schema_patch import sanitize_tools_for_gemini
 from MCP.trade_tool import build_trade_tools
@@ -16,6 +16,9 @@ import asyncio
 import streamlit as st
 import nest_asyncio
 from sql.risk import get_portfolio_diversification
+from Rag_Agent.analysis_agent import analysis_agent
+import json
+
 
 nest_asyncio.apply()
 
@@ -109,6 +112,31 @@ def agent(state: State):
 
 tool_node = ToolNode(tools)
 
+ROUTER_PROMPT = """
+Given this user query, decide which of these agents are needed: agent,analysis_agent.
+analysis_agent :needed if user ask to analysis this stock fundamentally or technically
+agent:any other query that is not related to fundamental analysis or technical analysis
+Return a JSON list, e.g. ["analysis_agent", "agent"].
+
+Query: {query}
+"""
+def parse_json_list(text: str):
+    return json.loads(text)
+def router_agent(state: State):
+    response = llm.invoke([
+        SystemMessage(content="You are a routing assistant. Return only JSON."),
+        HumanMessage(content=ROUTER_PROMPT.format(query=state["user_query"]))
+    ])
+    # parse response.content into a list of needed agents
+    needed = parse_json_list(response.content)
+    return {"needed_agents": needed}
+
+def route_decision(state: State):
+    # This function returns the name of the next node(s) to run
+    return state["needed_agents"]  
+
+
+
 
 # =====================================================
 # GRAPH BUILD (compiled per-call with a fresh checkpointer connection)
@@ -117,7 +145,16 @@ def build_graph() -> StateGraph:
     graph = StateGraph(State)
     graph.add_node("agent", agent)
     graph.add_node("tools", tool_node)
-    graph.set_entry_point("agent")
+    graph.add_node("analysis_agent",analysis_agent)
+    graph.add_node("router_agent", router_agent)
+    graph.add_conditional_edges(
+    "router_agent",
+    route_decision,
+    {
+        "analysis_agent": "analysis_agent",
+        "agent": "agent",
+    }
+)
     graph.add_conditional_edges(
         "agent",
         tools_condition,

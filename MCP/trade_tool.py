@@ -1,7 +1,8 @@
-# trade_tools.py
 import sqlite3
 import asyncio
 import copy
+import json
+import uuid
 from langchain_core.tools import tool
 
 from sql.risk import check_position_risk
@@ -138,6 +139,79 @@ def _extract_field(result, *keys):
     return None
 
 
+async def _call_alpaca_tool(tool_obj, args: dict) -> dict:
+    """
+    Invoke an MCP-backed LangChain tool and return the REAL structured order
+    data (matching Alpaca's REST API field names, e.g. filled_avg_price, id,
+    status), not just the human-readable text blocks.
+
+    Why this matters: langchain_mcp_adapters builds MCP tools with
+    response_format="content_and_artifact". If you call .ainvoke(args_dict)
+    with a plain args dict (as the old code did), LangChain only returns the
+    content half of that pair - a list of text/markdown blocks - and
+    SILENTLY DROPS the artifact, which is where the actual structured order
+    object (matching Alpaca's OpenAPI schema) lives.
+
+    Invoking with a proper ToolCall dict (type/name/args/id) makes LangChain
+    return a full ToolMessage, whose .artifact["structured_content"] holds
+    the real order dict.
+
+    NOTE: the Alpaca MCP server wraps the real order fields under a "data"
+    key, alongside a "_alpaca_mcp_security" trust-metadata block, e.g.:
+
+        {
+          "_alpaca_mcp_security": {...},
+          "data": {"id": "...", "status": "pending_new", ...}
+        }
+
+    We unwrap "data" here so every caller of this function (and
+    _extract_field downstream) sees the real order fields at the top level,
+    regardless of which MCP adapter/server version produced the response.
+    """
+    result = await tool_obj.ainvoke({
+        "type": "tool_call",
+        "name": tool_obj.name,
+        "args": args,
+        "id": f"call_{uuid.uuid4().hex[:8]}",
+    })
+
+    # Preferred path: structured content from the MCP artifact.
+    artifact = getattr(result, "artifact", None)
+    if artifact and isinstance(artifact, dict) and artifact.get("structured_content"):
+        payload = artifact["structured_content"]
+    else:
+        # Fallback: some MCP servers only populate the text content block
+        # with a JSON string. Try to parse that before giving up.
+        content = getattr(result, "content", result)
+        payload = None
+        if isinstance(content, str):
+            try:
+                payload = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                payload = None
+        elif isinstance(content, list):
+            for block in content:
+                text = block.get("text") if isinstance(block, dict) else None
+                if text:
+                    try:
+                        payload = json.loads(text)
+                        break
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+
+        if payload is None:
+            # Nothing usable found - return whatever we got so
+            # _extract_field can at least attempt its old normalization
+            # logic instead of crashing.
+            payload = content if isinstance(content, (dict, list)) else {}
+
+    # Unwrap the "data" envelope some MCP servers add around the real order.
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        payload = payload["data"]
+
+    return payload
+
+
 def build_trade_tools(alpaca_tools):
     """
     IMPORTANT: pass the RAW (unsanitized) Alpaca tools here — these tools call
@@ -197,18 +271,29 @@ def build_trade_tools(alpaca_tools):
                         "message": "This trade breaches your risk limits. Confirm to proceed anyway.",
                     }
 
-        order = await place_order.ainvoke({
+        order = await _call_alpaca_tool(place_order, {
             "symbol": symbol,
             "side": side,
-            "qty": quantity,
+            "qty": str(quantity),
             "type": "market",
             "time_in_force": "day",
         })
-        # ... rest unchanged
+        print("Debug ORder", order)
 
         fill_price = _extract_field(order, "filled_avg_price")
         order_id = _extract_field(order, "id", "order_id")
         status = _extract_field(order, "status")
+        print("debug", status, order_id, fill_price)
+
+        # Guard: if we still couldn't determine the order_id (e.g. an
+        # unexpected response shape from the MCP server), bail out loudly
+        # instead of silently tracking a pending order under a None key.
+        if not order_id:
+            return {
+                "status": "error",
+                "message": "Could not determine order_id from Alpaca response",
+                "raw": order,
+            }
 
         if status in ("rejected", "canceled", "expired"):
             return {"status": "order_failed", "order_id": order_id, "order_status": status, "raw": order}
@@ -216,13 +301,15 @@ def build_trade_tools(alpaca_tools):
         # Market orders can take a moment to fill — poll briefly if not filled yet
         for _ in range(5):
             if fill_price:
+                print("order successfull")
                 break
             await asyncio.sleep(1)
-            check = await get_order.ainvoke({"order_id": order_id})
+            check = await _call_alpaca_tool(get_order, {"order_id": order_id})
             fill_price = _extract_field(check, "filled_avg_price")
             status = _extract_field(check, "status") or status
 
         if not fill_price:
+            print("in pending order")
             _add_pending_order(order_id, symbol, side, quantity)
             return {
                 "status": "pending_not_recorded",
@@ -254,7 +341,7 @@ def build_trade_tools(alpaca_tools):
         nothing if already recorded or still unfilled. Rejected/canceled/expired
         orders are also removed from the pending queue.
         """
-        order = await get_order.ainvoke({"order_id": order_id})
+        order = await _call_alpaca_tool(get_order, {"order_id": order_id})
 
         status = _extract_field(order, "status")
         fill_price = _extract_field(order, "filled_avg_price")
