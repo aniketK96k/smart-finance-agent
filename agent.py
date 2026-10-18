@@ -1,4 +1,4 @@
-from typing import TypedDict, List, Annotated, Dict, Any
+from typing import TypedDict, List, Annotated, Dict, Any, Optional
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -50,6 +50,8 @@ api_key = os.getenv("GOOGLE_API_KEY")
 class State(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     needed_agents: List[str]
+    pdf_path: Optional[str]         # set only when the user uploads a PDF; cleared by analysis_agent
+    active_ticker: Optional[str]    # ticker of the most recently ingested filing
 
 
 # --------------------------------------------------
@@ -126,12 +128,23 @@ Return a JSON list, e.g. ["analysis_agent", "agent"].
 Query: {query}
 """
 
+VALID_AGENTS = {"agent", "analysis_agent"}
+
 
 def parse_json_list(text: str):
+    """Parse the router's JSON list. Tolerates ```json fences and falls back to
+    the general agent if the output is unusable."""
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+        cleaned = text.strip()
+        cleaned = cleaned.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError, AttributeError):
         return ["agent"]
+
+    if not isinstance(parsed, list):
+        return ["agent"]
+    valid = [a for a in parsed if a in VALID_AGENTS]
+    return valid or ["agent"]
 
 
 def router_agent(state: State):
@@ -141,7 +154,8 @@ def router_agent(state: State):
         SystemMessage(content="You are a routing assistant. Return only JSON."),
         HumanMessage(content=ROUTER_PROMPT.format(query=query))
     ])
-    needed = parse_json_list(response.content)
+    # Gemini can return content as a list of blocks, so normalise to text first
+    needed = parse_json_list(extract_text(response.content))
     return {"needed_agents": needed}
 
 
@@ -159,15 +173,18 @@ def build_graph() -> StateGraph:
     graph.add_node("tools", tool_node)
     graph.add_node("analysis_agent", analysis_agent)
     graph.add_node("router_agent", router_agent)
-    graph.add_edge(START, "agent")
-    #graph.add_conditional_edges(
-     #   "router_agent",
-      #  route_decision,
-       # {
-        #    "analysis_agent": "analysis_agent",
-         #   "agent": "agent",
-        #}
-    #)
+
+    # Router is the entry point again, so analysis_agent is reachable
+    graph.add_edge(START, "router_agent")
+    graph.add_conditional_edges(
+        "router_agent",
+        route_decision,
+        {
+            "analysis_agent": "analysis_agent",
+            "agent": "agent",
+        },
+    )
+
     graph.add_conditional_edges(
         "agent",
         tools_condition,
@@ -216,22 +233,30 @@ def _handle_result(result: dict):
 # CHAT (with SQLite-backed memory)
 # --------------------------------------------------
 
-async def chat_async(user_message: str, thread_id: str = "default"):
+async def chat_async(
+    user_message: str,
+    thread_id: str = "default",
+    pdf_path: Optional[str] = None,
+):
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as checkpointer:
         app = graph.compile(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
-        result = await app.ainvoke(
-            {
-                "messages": [HumanMessage(content=user_message)],
-                "needed_agents": [],
-            },
-            config=config,
-        )
+
+        inputs = {
+            "messages": [HumanMessage(content=user_message)],
+            "needed_agents": [],
+        }
+        # Only send pdf_path when there is a new upload. Never send None here:
+        # state is checkpointed, so None would wipe a still-pending upload.
+        if pdf_path:
+            inputs["pdf_path"] = pdf_path
+
+        result = await app.ainvoke(inputs, config=config)
         return _handle_result(result)
 
 
-def chat(user_message: str, thread_id: str = "default"):
-    return asyncio.run(chat_async(user_message, thread_id))
+def chat(user_message: str, thread_id: str = "default", pdf_path: Optional[str] = None):
+    return asyncio.run(chat_async(user_message, thread_id, pdf_path))
 
 
 # --------------------------------------------------

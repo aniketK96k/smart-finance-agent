@@ -24,23 +24,30 @@ Design:
      across companies (e.g. every 10-Q has a "Total assets" row).
 
 Install:
-    pip install chromadb pdfplumber python-dotenv --break-system-packages
+    pip install chromadb pdfplumber python-dotenv sentence-transformers --break-system-packages
 
     Also requires Ollama running locally with an embedding model pulled:
         ollama pull nomic-embed-text
         ollama serve   # usually already running as a background service
 
 Config (.env):
-    SEC_FILING_PATH=/absolute/path/to/aapl_10q.pdf   # required to run ingest
+    SEC_FILING_PATH=/absolute/path/to/aapl_10q.pdf   # only for the CLI entry point
     CHROMA_PERSIST_DIR=./chroma_sec_filings          # optional, has a default
     OLLAMA_BASE_URL=http://localhost:11434           # optional, has a default
     EMBED_MODEL=nomic-embed-text                     # optional, has a default
+    RERANK_ENABLED=true                              # optional, set false to skip reranking
+    RERANK_MODEL=BAAI/bge-reranker-base              # optional, has a default
 
 Usage:
-    python sec_rag_ingest.py
+    # From code (what the Streamlit upload flow uses):
+    from Rag_Agent.Rag_insertion_pipeline import ingest_file
+    meta = ingest_file("uploads/aapl.pdf")
+
+    # From the command line:
+    python Rag_insertion_pipeline.py
     # -> reads SEC_FILING_PATH from .env and ingests it.
 
-    from sec_rag_ingest import VectorStore
+    from Rag_insertion_pipeline import VectorStore
     store = VectorStore()
     store.query("What was gross margin?", ticker="AAPL")
 """
@@ -49,8 +56,8 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +72,12 @@ SEC_FILING_PATH = os.environ.get("SEC_FILING_PATH", "")
 CHROMA_PERSIST_DIR = os.environ.get("CHROMA_PERSIST_DIR", "./chroma_sec_filings")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+
+# Reranking: retrieve many candidates by vector similarity, then re-score each
+# (query, chunk) pair with a cross-encoder and keep only the best few.
+RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "true").lower() in ("1", "true", "yes")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-base")
+RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "512"))
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +115,60 @@ def load_document_text(path: str | Path) -> str:
         f"Unsupported file type '{suffix}' for {path}. "
         f"Supported: .pdf, .txt, .md"
     )
+
+
+# ---------------------------------------------------------------------------
+# 0b. EDGAR PDF clean-up.
+#     The EDGAR viewer's "Print to PDF" output wraps statement titles across
+#     two lines ("CONDENSED CONSOLIDATED BALANCE" / "SHEETS (Unaudited)") and
+#     pdfplumber garbles at least one of them. The single-line header regexes
+#     below can't match those, which used to make the cover page and all
+#     primary financial statements fall before the first detected header and
+#     get silently dropped.
+#     Fix: insert a clean one-line title ABOVE each wrapped title. The original
+#     lines stay in the body, so column headers like "9 Months Ended" and the
+#     period dates are preserved for retrieval.
+# ---------------------------------------------------------------------------
+_TITLE_FIXES = [
+    (r"^Cover Page Cover Page[^\n]*",
+     "COVER PAGE"),
+    (r"^CONDENSED CONSOLIDATED STATEMENTS[^\n]*\nOF OPERATIONS[^\n]*",
+     "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS"),
+    (r"^CONDENSED CONSOLIDATED STATEMENTS[^\n]*\nOF COMPREHENSIVE INCOME[^\n]*",
+     "CONDENSED CONSOLIDATED STATEMENTS OF COMPREHENSIVE INCOME"),
+    (r"^CONDENSED CONSOLIDATED BALANCE\nSHEETS[^\n]*Parenthetical[^\n]*",
+     "CONDENSED CONSOLIDATED BALANCE SHEETS (Parenthetical)"),
+    (r"^CONDENSED CONSOLIDATED BALANCE\nSHEETS \(Unaudited\) - USD[^\n]*",
+     "CONDENSED CONSOLIDATED BALANCE SHEETS"),
+    (r"^CONDENSED CONSOLIDATED STATEMENTS[^\n]*\nOF SHAREHOLDER[^\n]*",
+     "CONDENSED CONSOLIDATED STATEMENTS OF SHAREHOLDERS' EQUITY"),
+    (r"^CONDENSED CONSOLIDATED STATEMENTS[^\n]*\nOF CASH FLOWS[^\n]*",
+     "CONDENSED CONSOLIDATED STATEMENTS OF CASH FLOWS"),
+]
+
+
+def add_clean_titles(raw_text: str) -> str:
+    for pattern, title in _TITLE_FIXES:
+        raw_text = re.sub(
+            pattern,
+            lambda m, t=title: f"{t}\n{m.group(0)}",
+            raw_text,
+            flags=re.MULTILINE,
+        )
+    return raw_text
+
+
+# Page header ("8/29/26, 12:52 PM View Filing Data") and footer (viewer URL)
+# repeat on every page; they are noise inside chunks.
+_CHROME_RE = re.compile(
+    r"^(\d{1,2}/\d{1,2}/\d{2,4}, \d{1,2}:\d{2} [AP]M View Filing Data"
+    r"|https://www\.sec\.gov/cgi-bin/viewer\?.*)$",
+    re.MULTILINE,
+)
+
+
+def strip_page_chrome(raw_text: str) -> str:
+    return _CHROME_RE.sub("", raw_text)
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +377,19 @@ def build_chunks(raw_text: str, meta: FilingMeta) -> list[Chunk]:
     problem and oversized prose chunks hurt retrieval precision."""
     doc_id = meta.doc_id()
     out: list[Chunk] = []
+    seen_slugs: dict[str, int] = {}
+
     for section_title, section_body in split_into_sections(raw_text):
         section_slug = slugify(section_title)
+
+        # Two sections can share a title (e.g. "Commitments and Contingencies
+        # Disclosure" appears twice). Without this, they'd get the same chunk_id
+        # and the second upsert would silently overwrite the first.
+        occurrence = seen_slugs.get(section_slug, 0)
+        seen_slugs[section_slug] = occurrence + 1
+        if occurrence:
+            section_slug = f"{section_slug}_{occurrence}"
+
         table_like = is_table_like(section_body)
 
         pieces = [section_body.strip()] if table_like else chunk_text(section_body)
@@ -408,34 +486,107 @@ class VectorStore:
             out.append({"text": doc, "metadata": md, "distance": dist})
         return out
 
+    def query_reranked(self, query_text: str, k: int = 6, fetch_k: int = 30,
+                       rerank: bool | None = None, **filters) -> list[dict]:
+        """Two-stage retrieval: pull `fetch_k` candidates by vector similarity,
+        then let a cross-encoder reorder them and keep the best `k`.
+        `filters` are the same as query() (cik, ticker, form_type, ...).
+        rerank=None follows RERANK_ENABLED; True/False overrides it per call."""
+        use_rerank = RERANK_ENABLED if rerank is None else rerank
+        if not use_rerank:
+            return self.query(query_text, k=k, **filters)
+
+        candidates = self.query(query_text, k=max(fetch_k, k), **filters)
+        return get_reranker().rerank(query_text, candidates, top_k=k)
+
 
 # ---------------------------------------------------------------------------
-# 5. Ingest entry point -- driven entirely by env vars, no argparse.
+# 4b. Reranker. A bi-encoder (the embedding model) scores query and chunk
+#     separately, so near-identical numeric tables ("Total assets" in every
+#     statement) often score almost the same. A cross-encoder reads the query
+#     and the chunk TOGETHER and is much better at picking the right one.
+#     It is slower, so it only runs on the ~30 vector-search candidates.
+#
+#     Needs:  pip install sentence-transformers
+#     The model downloads from Hugging Face on first use. If it can't load
+#     (not installed, offline, ...) we log a warning and fall back to the
+#     plain vector order instead of failing the question.
+#
+#     RERANK_MODEL options: BAAI/bge-reranker-base (default, better quality),
+#     cross-encoder/ms-marco-MiniLM-L-6-v2 (much smaller and faster).
+#     Chunks longer than RERANK_MAX_LENGTH tokens are truncated for scoring
+#     only; the full chunk text is still what's returned.
 # ---------------------------------------------------------------------------
-def ingest_from_env() -> None:
-    if not SEC_FILING_PATH:
-        raise SystemExit(
-            "SEC_FILING_PATH is not set. Add it to your .env file, e.g.:\n"
-            "  SEC_FILING_PATH=/absolute/path/to/aapl_10q.pdf"
-        )
+class Reranker:
+    def __init__(self, model_name: str = RERANK_MODEL,
+                 max_length: int = RERANK_MAX_LENGTH):
+        self.model_name = model_name
+        self.max_length = max_length
+        self._model = None
+        self._load_failed = False
 
-    file_path = Path(SEC_FILING_PATH)
+    def _load(self):
+        if self._model is not None:
+            return self._model
+        if self._load_failed:
+            return None
+        try:
+            from sentence_transformers import CrossEncoder
+            self._model = CrossEncoder(self.model_name, max_length=self.max_length)
+        except Exception as e:  # missing package, no network, bad model name...
+            self._load_failed = True
+            print(f"[reranker] disabled: could not load '{self.model_name}' ({e}). "
+                  f"Falling back to vector-search order.")
+            return None
+        return self._model
+
+    def rerank(self, query: str, candidates: list[dict], top_k: int) -> list[dict]:
+        if not candidates:
+            return []
+        model = self._load()
+        if model is None:
+            return candidates[:top_k]
+
+        scores = model.predict([(query, c["text"]) for c in candidates])
+        ranked = sorted(zip(candidates, scores), key=lambda p: float(p[1]), reverse=True)
+        return [{**c, "rerank_score": float(s)} for c, s in ranked[:top_k]]
+
+
+@lru_cache(maxsize=1)
+def get_reranker() -> Reranker:
+    """One shared instance per process, so the model loads once and stays in
+    memory across Streamlit reruns instead of reloading on every question."""
+    return Reranker()
+
+
+# ---------------------------------------------------------------------------
+# 5. Ingest entry points.
+#    ingest_file(path)   -- used by the Streamlit upload flow. Raises
+#                           exceptions (never sys.exit) so callers can handle them.
+#    ingest_from_env()   -- CLI convenience; reads SEC_FILING_PATH from .env.
+# ---------------------------------------------------------------------------
+def ingest_file(path: str | Path) -> FilingMeta:
+    file_path = Path(path)
     if not file_path.exists():
-        raise SystemExit(f"SEC_FILING_PATH points to a file that doesn't exist: {file_path}")
+        raise FileNotFoundError(f"File not found: {file_path}")
 
     raw_text = load_document_text(file_path)
     print(f"Loaded {len(raw_text)} chars from {file_path}")
 
+    # Metadata comes from the RAW text: the accession number lives in the
+    # page-footer URL, which strip_page_chrome() removes below.
     meta, warnings = extract_filing_meta(raw_text)
     if warnings:
-        print(f"ERROR: could not auto-detect {', '.join(warnings)} from the "
-              f"cover page. This file may not be an EDGAR viewer export.")
-        sys.exit(1)
+        raise ValueError(
+            f"Could not auto-detect {', '.join(warnings)} from the cover page. "
+            f"This file may not be an EDGAR viewer export."
+        )
 
     print(f"Detected: {meta.company_name} ({meta.ticker}) | {meta.form_type} | "
           f"{meta.fiscal_period_end} | CIK {meta.cik}")
 
-    chunks = build_chunks(raw_text, meta)
+    clean_text = strip_page_chrome(add_clean_titles(raw_text))
+    chunks = build_chunks(clean_text, meta)
     print(f"doc_id: {meta.doc_id()}")
     print(f"Parsed {len(chunks)} chunks across "
           f"{len({c.metadata['section_slug'] for c in chunks})} sections.")
@@ -443,6 +594,19 @@ def ingest_from_env() -> None:
     store = VectorStore(persist_dir=CHROMA_PERSIST_DIR)
     store.upsert(chunks)
     print(f"Upserted into Chroma collection at '{CHROMA_PERSIST_DIR}'.")
+    return meta
+
+
+def ingest_from_env() -> None:
+    if not SEC_FILING_PATH:
+        raise SystemExit(
+            "SEC_FILING_PATH is not set. Add it to your .env file, e.g.:\n"
+            "  SEC_FILING_PATH=/absolute/path/to/aapl_10q.pdf"
+        )
+    try:
+        ingest_file(SEC_FILING_PATH)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(f"ERROR: {e}")
 
 
 if __name__ == "__main__":

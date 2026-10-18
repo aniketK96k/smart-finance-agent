@@ -1,3 +1,5 @@
+import os
+import hashlib
 import streamlit as st
 from agent import chat, resume_chat
 
@@ -11,6 +13,8 @@ st.title("📈 Financial AI Agent")
 st.write("Ask anything about your financial data.")
 
 THREAD_ID = "default"  # swap for a per-user/session id if you have one
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --------------------------------------------------
 # Session state
@@ -20,6 +24,44 @@ if "messages" not in st.session_state:
 
 if "pending_interrupt" not in st.session_state:
     st.session_state.pending_interrupt = None  # holds payload dict while waiting on approval
+
+if "pending_pdf_path" not in st.session_state:
+    st.session_state.pending_pdf_path = None   # set on upload, cleared once sent to the agent
+
+if "last_pdf_hash" not in st.session_state:
+    st.session_state.last_pdf_hash = None      # avoids re-saving the same file on every rerun
+
+# --------------------------------------------------
+# Sidebar: PDF upload for the analysis (RAG) agent
+# --------------------------------------------------
+with st.sidebar:
+    st.subheader("📄 Filing for analysis")
+    uploaded_pdf = st.file_uploader(
+        "Upload a 10-Q / 10-K PDF",
+        type=["pdf"],
+        key="pdf_uploader",
+    )
+
+    if uploaded_pdf is not None:
+        data = uploaded_pdf.getvalue()
+        file_hash = hashlib.md5(data).hexdigest()
+
+        # Streamlit reruns the script on every interaction; only save a given file once
+        if st.session_state.last_pdf_hash != file_hash:
+            safe_name = os.path.basename(uploaded_pdf.name)
+            path = os.path.join(UPLOAD_DIR, f"{file_hash[:8]}_{safe_name}")
+            with open(path, "wb") as f:
+                f.write(data)
+            st.session_state.pending_pdf_path = path
+            st.session_state.last_pdf_hash = file_hash
+
+        if st.session_state.pending_pdf_path:
+            st.info(
+                f"**{uploaded_pdf.name}** is queued. It will be indexed when "
+                f"you ask an analysis question."
+            )
+        else:
+            st.success(f"**{uploaded_pdf.name}** sent to the agent.")
 
 # --------------------------------------------------
 # Display previous messages
@@ -78,7 +120,14 @@ else:
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                result = chat(prompt, thread_id=THREAD_ID)
+                # Pass the PDF path only when a new file is waiting
+                result = chat(
+                    prompt,
+                    thread_id=THREAD_ID,
+                    pdf_path=st.session_state.pending_pdf_path,
+                )
+                # Cleared only after chat() succeeded; if it raised, the upload stays queued
+                st.session_state.pending_pdf_path = None
 
                 if result["status"] == "interrupted":
                     st.session_state.pending_interrupt = result["payload"]
