@@ -1,262 +1,189 @@
 # 📈 Smart Finance Agent
 
-An AI-powered multi-agent financial assistant that combines **LangGraph, Google Gemini, Alpaca paper trading, natural-language SQL, RAG-based financial analysis, portfolio risk management, and persistent conversational memory**.
+An AI-powered multi-agent financial assistant that combines **LangGraph, Google Gemini, Alpaca paper trading, natural-language SQL, RAG-based SEC filing analysis, portfolio risk management, and persistent conversational memory**.
 
-The system uses a **router-based multi-agent architecture** to determine whether a user request requires financial analysis or general financial assistance.
+A router decides whether a request needs deep financial analysis (answered from an uploaded SEC filing via RAG) or general financial assistance (SQL, portfolio, trading, ERP tools).
 
 ---
 
 ## 🚀 Features
 
-### 🤖 Multi-Agent Architecture
+- **Router-based multi-agent architecture** (LangGraph + Gemini)
+- **Upload a 10-Q / 10-K PDF in the UI** and ask questions grounded in that filing
+- **RAG pipeline for SEC filings**: section-aware parsing, metadata partitioning, local embeddings (Ollama), ChromaDB, and **cross-encoder reranking**
+- **Natural-language SQL** over a local financial database
+- **Alpaca paper trading** through controlled Python-level tools
+- **Portfolio risk checks** and diversification analysis
+- **Human-in-the-loop approval** for risk-flagged trades
+- **Persistent conversation memory** (LangGraph SQLite checkpointer)
 
-The application uses a router to intelligently direct user queries to the appropriate agent.
+### Example
 
-* **Router Agent** — determines which agent should handle the request.
-* **General Finance Agent** — handles financial queries, SQL queries, portfolio information, trading, ERP data, and other tools.
-* **Analysis Agent** — handles fundamental and technical stock analysis using the RAG pipeline.
-* **Tool Node** — executes tools selected by the general finance agent.
-* **Persistent Memory** — maintains conversations using LangGraph's SQLite checkpointer.
-
-Example:
-
-```text
+```
 "What is my AAPL balance?"
         ↓
    Router Agent
         ↓
-   General Agent
-        ↓
-   SQL Tool
-        ↓
-     Response
+   General Agent → SQL Tool → Response
 ```
 
-While:
-
-```text
-"Analyze AAPL fundamentally"
+```
+"What was Apple's gross margin this quarter?"
         ↓
    Router Agent
         ↓
   Analysis Agent
         ↓
-   RAG Pipeline
-        ↓
- Financial Analysis
+  Vector search (30 candidates) → Reranker (top 6) → Gemini → Response
 ```
 
 ---
 
 # 🏗️ Architecture
 
-```text
-                         ┌─────────────────┐
-                         │     User        │
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │    Streamlit    │
-                         │    Frontend     │
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │  Router Agent   │
-                         │     Gemini      │
-                         └────────┬────────┘
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │                           │
-                    ▼                           ▼
-          ┌─────────────────┐         ┌─────────────────┐
-          │ Analysis Agent  │         │  General Agent  │
-          │                 │         │                 │
-          │ Fundamental     │         │ Financial Q&A   │
-          │ Technical       │         │ SQL             │
-          │ RAG             │         │ Trading         │
-          │ Documents       │         │ Portfolio       │
-          └────────┬────────┘         │ ERP             │
-                   │                  │ Risk             │
-                   ▼                  └────────┬────────┘
-          ┌─────────────────┐                  │
-          │   RAG Pipeline  │                  ▼
-          │                 │         ┌─────────────────┐
-          │ Documents       │         │    Tool Node    │
-          │ Chunking        │         └────────┬────────┘
-          │ Embeddings      │                  │
-          │ Vector Store    │                  │
-          │ Retrieval       │                  │
-          └────────┬────────┘                  │
-                   │                           │
-                   └─────────────┬─────────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │     Response    │
-                        └─────────────────┘
+```
+               ┌─────────────────┐
+               │      User       │
+               └────────┬────────┘
+                        │
+                        ▼
+               ┌─────────────────┐
+               │    Streamlit    │◄── Sidebar: PDF upload
+               │    Frontend     │
+               └────────┬────────┘
+                        │  message (+ pdf_path on a new upload)
+                        ▼
+               ┌─────────────────┐
+               │  Router Agent   │
+               │     Gemini      │
+               └────────┬────────┘
+                        │
+          ┌─────────────┴─────────────┐
+          │                           │
+          ▼                           ▼
+┌───────────────────┐         ┌─────────────────┐
+│  Analysis Agent   │         │  General Agent  │
+│                   │         │                 │
+│ Ingest PDF        │         │ Financial Q&A   │
+│ (only on upload)  │         │ SQL             │
+│ Retrieve + rerank │         │ Trading         │
+│ Gemini analysis   │         │ Portfolio / Risk│
+└─────────┬─────────┘         │ ERP             │
+          │                   └────────┬────────┘
+          ▼                            ▼
+┌───────────────────┐         ┌─────────────────┐
+│   RAG Pipeline    │         │    Tool Node    │
+│ ChromaDB + Ollama │         └────────┬────────┘
+│ embeddings        │                  │
+│ Cross-encoder     │                  │
+│ reranker          │                  │
+└─────────┬─────────┘                  │
+          └─────────────┬──────────────┘
+                        ▼
+               ┌─────────────────┐
+               │    Response     │
+               └─────────────────┘
 
-                 ┌──────────────────────────┐
-                 │   SQLite Checkpointer    │
-                 │     Persistent Memory    │
-                 └──────────────────────────┘
+       ┌──────────────────────────┐
+       │   SQLite Checkpointer    │
+       │     Persistent Memory    │
+       └──────────────────────────┘
 ```
 
 ---
 
-# 🧠 Agent Responsibilities
+# 🧠 Agents
 
 ## 1. Router Agent
 
-The router is the entry point for user requests.
+The entry point of the graph. Gemini classifies the query and returns a JSON list of the agents needed (`["analysis_agent"]`, `["agent"]`, or both). Output parsing tolerates code fences and list-style responses, and falls back to the general agent if the output is unusable.
 
-It uses Gemini to classify the query and determine which agents are required.
+**Analysis requests** (fundamental/technical analysis, financial health, filing questions) go to the **Analysis Agent**.
+**Everything else** (balances, holdings, trades, transactions, diversification, ERP) goes to the **General Finance Agent**.
 
-Current routing logic:
+## 2. Analysis Agent
 
-```text
-User Query
-    ↓
-Router Agent
-    ↓
-┌──────────────────────────────┐
-│                              │
-▼                              ▼
-Analysis Agent             General Agent
+Answers questions about a company using SEC filing content retrieved with RAG.
+
+```
+Uploaded PDF? ── yes ──► Ingest into ChromaDB (once) ──┐
+      │                                                 │
+      no ─────────────────────────────────────────────►│
+                                                        ▼
+                                     Retrieve 30 candidates by vector search
+                                                        ▼
+                                     Rerank with a cross-encoder → top 6
+                                                        ▼
+                                              Gemini answers using
+                                              ONLY the retrieved excerpts
 ```
 
-The router identifies requests such as:
+Key behaviours:
 
-### Analysis requests
+- **Ingestion runs only when a PDF is uploaded.** The UI passes the saved file path into the graph state; the analysis agent ingests it and then clears `pdf_path`, so later turns never re-ingest.
+- **Retrieval is scoped to the uploaded company.** The ticker is read from the filing's cover page and stored in state as `active_ticker`, so a question about Apple never retrieves another company's chunks.
+- **Grounded answers.** Gemini is instructed to answer only from the retrieved excerpts and to say so when they don't contain the answer.
+- **Clear failures.** If a PDF can't be indexed (for example it isn't an EDGAR filing export), the error is shown in chat instead of crashing the app.
 
-```text
-"Analyze Apple fundamentally"
-"Give me technical analysis of NVDA"
-"Analyze the financial health of AAPL"
-"Is this stock fundamentally strong?"
-```
+## 3. General Finance Agent
 
-These are routed to the **Analysis Agent**.
+A tool-calling Gemini agent for everything that isn't filing analysis.
 
-### General requests
+Available tool categories:
 
-```text
-"What is my wallet balance?"
-"Show my holdings"
-"Buy 10 shares of AAPL"
-"Show my last 5 transactions"
-"How diversified is my portfolio?"
-```
-
-These are routed to the **General Finance Agent**.
+- SQL financial database
+- Alpaca account information (read-only tools)
+- Trading tools (controlled, Python-level)
+- ERP information
+- Portfolio risk and diversification
 
 ---
 
-# 🔍 2. Analysis Agent
+# 🧾 RAG Pipeline (`Rag_Agent/Rag_insertion_pipeline.py`)
 
-The Analysis Agent is responsible for deeper financial analysis.
+Built for SEC filings exported from EDGAR's **"View Filing Data"** viewer (printed to PDF).
 
-It can use the RAG pipeline to retrieve relevant information from financial documents before generating an analysis.
-
-Typical workflow:
-
-```text
-User Query
-    ↓
-Analysis Agent
-    ↓
-Document Retrieval
-    ↓
-Relevant Financial Documents
-    ↓
-LLM Analysis
-    ↓
-Final Response
+```
+PDF
+ ↓  pdfplumber text extraction
+ ↓  cover-page metadata extraction (ticker, CIK, form type, period, accession no.)
+ ↓  clean-up: fix wrapped statement titles, strip page headers/footers
+ ↓  section splitting (balance sheet, income statement, cash flows, notes, ...)
+ ↓  chunking (tables kept whole, prose word-bounded with overlap)
+ ↓  context prefix on every chunk: [Company (TICKER) — 10-Q — Q3 FY2026 — Section]
+ ↓  embeddings via Ollama (nomic-embed-text)
+ ↓  ChromaDB (persistent, metadata-filtered)
 ```
 
-The analysis agent is intended for:
+### Design decisions
 
-* Fundamental analysis
-* Technical analysis
-* Financial report analysis
-* Company document analysis
-* SEC/financial filing analysis
-* RAG-powered financial research
+- **Deterministic document IDs** from `(CIK, form type, period end, accession number)`, so re-ingesting the same filing is idempotent.
+- **Table-aware chunking.** Numeric tables are never split mid-row; each table-like section stays a single chunk so values remain attributable to their column headers.
+- **Context prefix before embedding** bakes company/period/section into every vector, on top of metadata filters.
+- **Metadata partitioning** (`cik`, `ticker`, `form_type`, `section_slug`, `is_latest`) so retrieval for one company never bleeds into another. Every 10-Q has a "Total assets" row, so raw embeddings alone collide badly across companies.
+- **EDGAR PDF clean-up.** The viewer's PDF output wraps statement titles across two lines, which would otherwise cause the cover page and all primary financial statements to be dropped. Clean one-line titles are inserted above each wrapped title, and repeated page headers/footers are removed.
+- **Unique chunk IDs** even when two sections share a title.
 
----
+### Two-stage retrieval with reranking
 
-# 💬 3. General Finance Agent
-
-The General Finance Agent handles queries that don't require the specialized analysis agent.
-
-It is a tool-calling Gemini agent.
-
-```text
-User Query
-    ↓
-General Agent
-    ↓
-Gemini Tool Calling
-    ↓
-Tool Node
-    ↓
-Tool Execution
-    ↓
-General Agent
-    ↓
-Final Response
+```
+Question
+   ↓
+Stage 1 — vector search (bi-encoder, fast, rough)
+   ChromaDB returns the 30 closest chunks, filtered by ticker
+   ↓
+Stage 2 — reranker (cross-encoder, slower, precise)
+   Scores each (question, chunk) pair together and sorts
+   ↓
+Top 6 chunks → Gemini
 ```
 
-Available tool categories include:
+The embedding model scores the question and each chunk separately, so near-identical financial tables often score almost the same. A cross-encoder reads the question and chunk together and is much better at picking the right one.
 
-* SQL financial database
-* Alpaca account information
-* Trading tools
-* ERP information
-* Portfolio risk
-* Portfolio diversification
-
----
-
-# 🛠️ Tools
-
-## SQL Database
-
-The agent can interact with the local financial database using natural language.
-
-Examples:
-
-```text
-"What's my AAPL position worth?"
-
-"Show my last 5 transactions"
-
-"What's my current wallet balance?"
-
-"Show all my holdings"
-```
-
-The SQL tool converts the request into an appropriate database query.
-
----
-
-## 📊 Alpaca
-
-The application integrates with the Alpaca MCP server for paper trading and account information.
-
-Capabilities include:
-
-* Account information
-* Positions
-* Market information
-* Orders
-* Trading operations
-* Portfolio information
-
-Raw order-placement tools are not directly exposed to the LLM.
-
-Instead, trading operations are wrapped in controlled Python-level tools.
+- Default model: `BAAI/bge-reranker-base` (downloads from Hugging Face on first use).
+- Lighter option: `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+- If the reranker can't load, the pipeline logs a warning and falls back to plain vector order.
+- Chunks longer than `RERANK_MAX_LENGTH` tokens are truncated for **scoring only**; the full chunk is still returned.
 
 ---
 
@@ -264,11 +191,7 @@ Instead, trading operations are wrapped in controlled Python-level tools.
 
 Trading operations are intentionally separated from unrestricted LLM tool calling.
 
-The architecture prevents the model from directly deciding how multiple financial operations should be chained.
-
-Instead:
-
-```text
+```
 LLM
  ↓
 Trading Tool
@@ -280,270 +203,103 @@ Alpaca
 Local Database Update
 ```
 
-This allows business rules and safety checks to remain in deterministic Python code rather than relying on the LLM.
-
----
+Raw order-placement tools (`place_stock_order`, `place_crypto_order`, `place_option_order`) are never exposed to the LLM. Business rules and safety checks stay in deterministic Python code.
 
 # 🛡️ Portfolio Risk Management
 
-Before a trade is executed, the system can perform portfolio risk checks.
+Before a trade is executed, configurable limits are checked:
 
-Current configurable limits include:
+- Maximum individual position concentration
+- Maximum sector concentration
 
-* Maximum individual position concentration
-* Maximum sector concentration
-
-Example:
-
-```text
-Buy AAPL
-    ↓
-Risk Check
-    ↓
-Would exceed position limit?
-    ↓
-YES
-    ↓
-needs_confirmation
+```
+Buy AAPL → Risk Check → Would exceed limit? → needs_confirmation → user approves or rejects
 ```
 
-The user can then explicitly confirm the trade.
-
----
+Risk-flagged trades pause the graph with a LangGraph interrupt; the Streamlit UI shows **Approve / Reject** buttons and resumes the run.
 
 # 📈 Portfolio Diversification
 
-The application provides a portfolio diversification tool that can calculate:
-
-* Sector allocation
-* Portfolio concentration
-* Largest position
-* Portfolio diversification information
-
-Example:
-
-```text
-"How diversified is my portfolio?"
-```
-
-The agent can retrieve the current portfolio and provide a sector-level breakdown.
-
----
-
-# 🧾 RAG Pipeline
-
-The analysis agent uses a Retrieval-Augmented Generation workflow.
-
-The general pipeline is:
-
-```text
-Financial Documents
-        ↓
-     Loading
-        ↓
-     Chunking
-        ↓
-    Embeddings
-        ↓
-   Vector Store
-        ↓
-    Retrieval
-        ↓
- Analysis Agent
-        ↓
-      Gemini
-        ↓
-    Response
-```
-
-This allows the analysis agent to ground its answers in company financial documents instead of relying entirely on the LLM's internal knowledge.
+The diversification tool calculates sector allocation, portfolio concentration, and the largest position.
 
 ---
 
 # 🧠 Persistent Conversation Memory
 
-LangGraph's SQLite checkpointer is used to persist conversation state.
+LangGraph's SQLite checkpointer (`AsyncSqliteSaver`) persists conversation state per `thread_id`, so conversations survive Streamlit refreshes and application restarts. Chat history can be deleted from the app.
 
-```text
-User
- ↓
-LangGraph
- ↓
-State
- ↓
-SQLite Checkpointer
-```
-
-Each conversation is associated with a `thread_id`.
-
-This allows conversations to survive:
-
-* Streamlit refreshes
-* Application restarts
-* New requests within the same conversation
-
-Chat history can also be deleted using the application's history-management functionality.
+Because state is checkpointed, one-shot flags like `pdf_path` are cleared by the node that consumes them.
 
 ---
 
-# 🗃️ Database Architecture
+# 🗃️ Databases and Storage
 
-The project uses SQLite databases for different purposes.
-
-### Financial Database
-
-```text
-data/finance.db
-```
-
-Stores financial application data such as:
-
-* Wallet
-* Holdings
-* Ledger
-* Pending orders
-* Sector information
-
-### Conversation Database
-
-```text
-checkpoints.db
-```
-
-Stores LangGraph checkpoint state and conversation history.
-
----
-
-# 🔄 Complete Request Flow
-
-A typical request goes through the following pipeline:
-
-```text
-                    USER
-                      │
-                      ▼
-                 Streamlit
-                      │
-                      ▼
-                Router Agent
-                      │
-          ┌───────────┴───────────┐
-          │                       │
-          ▼                       ▼
-   Analysis Agent           General Agent
-          │                       │
-          ▼                       ▼
-      RAG Tools              Tool Calling
-          │                       │
-          │                 ┌─────┴──────┐
-          │                 │            │
-          │                 ▼            ▼
-          │             Tool Node    SQL/Alpaca/
-          │                 │        Risk/ERP/etc.
-          │                 │            │
-          └─────────────────┴────────────┘
-                            │
-                            ▼
-                         Response
-```
-
----
-
-# 🔐 Why Use a Multi-Agent Architecture?
-
-A single large agent can become difficult to maintain as the number of tools and responsibilities increases.
-
-The multi-agent design separates responsibilities.
-
-### Router Agent
-
-Responsible for:
-
-```text
-"What type of request is this?"
-```
-
-### General Agent
-
-Responsible for:
-
-```text
-"Which financial tool should I use?"
-```
-
-### Analysis Agent
-
-Responsible for:
-
-```text
-"How should I analyze this company/stock?"
-```
-
-This provides better separation of concerns and makes the system easier to extend.
+| Store | Location | Purpose |
+|---|---|---|
+| Financial database | `data/finance.db` | Wallet, holdings, ledger, pending orders, sectors |
+| Conversation memory | `checkpoints.db` | LangGraph checkpoints and chat history |
+| Vector database | `chroma_sec_filings/` | Embedded SEC filing chunks |
+| Uploaded PDFs | `uploads/` | Files saved by the Streamlit uploader |
 
 ---
 
 # 🧰 Tech Stack
 
-| Layer                  | Technology                      |
-| ---------------------- | ------------------------------- |
-| Agent orchestration    | LangGraph                       |
-| LLM                    | Google Gemini                   |
-| Multi-agent routing    | LangGraph + Gemini              |
-| RAG                    | LangChain / custom RAG pipeline |
-| Trading                | Alpaca MCP                      |
-| Tool integration       | LangChain Tools / MCP           |
-| Database               | SQLite                          |
-| Financial queries      | LangChain SQLDatabaseToolkit    |
-| Frontend               | Streamlit                       |
-| Memory                 | LangGraph AsyncSqliteSaver      |
-| Environment management | python-dotenv                   |
+| Layer | Technology |
+|---|---|
+| Agent orchestration | LangGraph |
+| LLM | Google Gemini |
+| Multi-agent routing | LangGraph + Gemini |
+| PDF parsing | pdfplumber |
+| Embeddings | Ollama (`nomic-embed-text`), local |
+| Vector store | ChromaDB (persistent) |
+| Reranking | sentence-transformers cross-encoder (`BAAI/bge-reranker-base`) |
+| Trading | Alpaca MCP |
+| Tool integration | LangChain Tools / MCP |
+| Database | SQLite |
+| Financial queries | LangChain SQLDatabaseToolkit |
+| Frontend | Streamlit |
+| Memory | LangGraph AsyncSqliteSaver |
+| Environment management | python-dotenv |
 
 ---
 
 # 📁 Project Structure
 
-```text
+```
 smart-finance-agent/
 │
 ├── agent.py
-│   └── Main LangGraph multi-agent orchestration
+│   └── LangGraph orchestration: router, agents, tools, chat/resume/history
 │
 ├── app.py
-│   └── Streamlit frontend
+│   └── Streamlit frontend (chat, approvals, PDF upload sidebar)
 │
 ├── Rag_Agent/
-│   └── analysis_agent.py
-│       └── Financial analysis agent / RAG workflow
+│   ├── analysis_agent.py
+│   │   └── Analysis agent: ingest-on-upload, retrieval, grounded answer
+│   │
+│   └── Rag_insertion_pipeline.py
+│       └── PDF → sections → chunks → embeddings → ChromaDB, plus reranker
 │
 ├── MCP/
-│   ├── mcpclient.py
-│   │   └── Alpaca MCP client
-│   │
-│   └── trade_tool.py
-│       └── Controlled trading tools
+│   ├── mcpclient.py        └── Alpaca MCP client
+│   └── trade_tool.py       └── Controlled trading tools
 │
 ├── sanitizerGemini/
-│   └── gemini_schema_patch.py
-│       └── Gemini-compatible MCP schemas
+│   └── gemini_schema_patch.py   └── Gemini-compatible MCP schemas
 │
 ├── sql/
-│   ├── sqlDB.py
-│   │   └── SQL database tools
-│   │
-│   └── risk.py
-│       └── Portfolio risk/diversification tools
+│   ├── sqlDB.py            └── SQL database tools
+│   └── risk.py             └── Portfolio risk / diversification tools
 │
 ├── data/
-│   └── finance.db
-│       └── Financial application database
+│   └── finance.db          └── Financial application database
 │
-├── checkpoints.db
-│   └── LangGraph conversation memory
-│
-├── setup_trading_tables.py
-│   └── Database initialization
-│
+├── uploads/                └── Uploaded PDFs (git-ignored)
+├── chroma_sec_filings/     └── Vector DB (git-ignored)
+├── checkpoints.db          └── LangGraph conversation memory
+├── setup_trading_tables.py └── Database initialization
 ├── requirements.txt
 └── README.md
 ```
@@ -554,32 +310,35 @@ smart-finance-agent/
 
 ## Prerequisites
 
-* Python 3.10+
-* `uv`
-* Alpaca paper trading account
-* Google Gemini API key
-
----
+- Python 3.10+
+- Alpaca paper trading account
+- Google Gemini API key
+- [Ollama](https://ollama.com) installed and running (for embeddings)
 
 ## Installation
 
-Clone the repository:
-
 ```bash
 git clone https://github.com/aniketK96k/smart-finance-agent.git
-```
-
-Move into the project:
-
-```bash
 cd smart-finance-agent
-```
-
-Install dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
+
+The RAG features need these packages (add them to `requirements.txt` if they aren't there):
+
+```
+pdfplumber
+chromadb
+python-dotenv
+sentence-transformers
+```
+
+## Pull the embedding model
+
+```bash
+ollama pull nomic-embed-text
+```
+
+Ollama listens on `http://localhost:11434` by default. Open that address in a browser to confirm it's running.
 
 ---
 
@@ -588,33 +347,50 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```env
+# --- LLM (Gemini) ---
 GOOGLE_API_KEY=your_google_api_key
 
+# --- Alpaca paper trading ---
 AlpacaKey=your_alpaca_api_key
 AlpacaSecret=your_alpaca_secret_key
+
+# --- RAG: embeddings (Ollama, runs locally) ---
+OLLAMA_BASE_URL=http://localhost:11434
+EMBED_MODEL=nomic-embed-text
+
+# --- RAG: vector store ---
+CHROMA_PERSIST_DIR=./chroma_sec_filings
+
+# --- RAG: reranker ---
+RERANK_ENABLED=true
+RERANK_MODEL=BAAI/bge-reranker-base
+RERANK_MAX_LENGTH=512
+
+# --- Command-line ingestion only (not needed for Streamlit uploads) ---
+# SEC_FILING_PATH=/absolute/path/to/aapl.pdf
 ```
 
-Never commit your `.env` file to GitHub.
+Only `GOOGLE_API_KEY`, `AlpacaKey` and `AlpacaSecret` are required. Everything else has a default.
 
-Add it to `.gitignore`:
+Never commit your `.env` file. Add this to `.gitignore`:
 
-```text
+```
 .env
+uploads/
+chroma_sec_filings/
 ```
+
+> **Changing `EMBED_MODEL`?** Delete `chroma_sec_filings/` and re-upload your filings. Different embedding models produce different vector sizes, and ChromaDB will error if one collection mixes them.
 
 ---
 
 # 🗄️ Initialize Database
 
-Run:
-
 ```bash
 python setup_trading_tables.py
 ```
 
-This initializes the required financial tables.
-
-You can seed the wallet with an initial paper balance:
+Seed the wallet with an initial paper balance:
 
 ```bash
 python -c "
@@ -630,13 +406,25 @@ conn.close()
 
 # ▶️ Run the Application
 
-Start Streamlit:
-
 ```bash
 streamlit run app.py
 ```
 
-The application will open in your browser.
+## Using filing analysis
+
+1. Download a 10-Q or 10-K from EDGAR's **View Filing Data** viewer as a PDF (print the page to PDF).
+2. In the Streamlit sidebar, upload the PDF under **Filing for analysis**.
+3. Ask an analysis question, for example *"What was Apple's gross margin for the nine months ended June 27, 2026?"*
+
+The file is indexed the first time an analysis question is asked after the upload. If your next message is routed to the general agent instead (for example *"show my holdings"*), the upload stays queued until the analysis agent runs.
+
+The first question after starting the app is slower because the reranker model loads (and downloads, the very first time).
+
+You can also ingest from the command line:
+
+```bash
+python Rag_Agent/Rag_insertion_pipeline.py   # reads SEC_FILING_PATH from .env
+```
 
 ---
 
@@ -644,140 +432,79 @@ The application will open in your browser.
 
 ### Portfolio
 
-```text
+```
 What's my current wallet balance?
-```
-
-```text
 Show me my holdings.
-```
-
-```text
 How diversified is my portfolio?
 ```
 
 ### SQL
 
-```text
-Show my last 5 transactions.
 ```
-
-```text
+Show my last 5 transactions.
 What's my AAPL position worth?
 ```
 
 ### Trading
 
-```text
-Buy 10 shares of AAPL.
 ```
-
-```text
+Buy 10 shares of AAPL.
 Sell 5 shares of MSFT.
 ```
 
-### Financial Analysis
+### Filing analysis (after uploading a PDF)
 
-```text
-Analyze AAPL fundamentally.
 ```
-
-```text
-Give me a technical analysis of TSLA.
-```
-
-```text
-Analyze the financial health of this company.
+What was net sales for the nine months ended June 27, 2026?
+What were total assets and total liabilities?
+How much cash did operations generate?
+Break down revenue by product category.
+Summarise the segment operating income by region.
 ```
 
 ---
 
 # ⚠️ Known Limitations
 
-### 1. First-time position risk estimation
-
-The current risk system may not be able to calculate an accurate trade value for a symbol that has no existing local position.
-
-A live market-price lookup can be added to improve this.
-
-### 2. Sector information
-
-New holdings may not automatically have sector information.
-
-A fundamentals/market-data integration can be added to automatically populate sectors.
-
-### 3. Pending orders
-
-Orders placed while markets are closed may require synchronization before being reflected in the local ledger.
-
-### 4. Single-user architecture
-
-The current wallet and holdings database is designed primarily for a single-user application.
-
-Multi-user authentication and user-specific portfolios can be added later.
-
-### 5. Paper trading
-
-The project is intended to use Alpaca paper trading by default.
+1. **EDGAR viewer exports only.** Metadata (ticker, CIK, period, accession number) is read from the "View Filing Data" cover page. A PDF without those fields is rejected with an error message. Supporting arbitrary PDFs would need a metadata fallback.
+2. **Layout-specific section detection.** Statement titles are normalised for Apple's filing layout. Other companies may word titles differently, so check the section count after the first upload of a new company.
+3. **Long table chunks are truncated for reranking.** The reranker scores about the first 512 tokens of each chunk. The full chunk is still sent to Gemini.
+4. **One active company per thread.** Each upload overwrites `active_ticker`, so questions target the most recently uploaded company. Without any upload, retrieval searches all ingested filings.
+5. **First-time position risk estimation.** The risk system may not calculate an accurate trade value for a symbol with no existing local position. A live price lookup can fix this.
+6. **Sector information.** New holdings may not automatically have sector data.
+7. **Pending orders.** Orders placed while markets are closed may need synchronisation before appearing in the local ledger.
+8. **Single-user architecture.** The wallet and holdings database is designed for one user.
+9. **Paper trading only by default.**
 
 ---
 
 # 🔮 Future Improvements
 
-Potential improvements include:
-
-* Automatic stock-price retrieval for risk calculations
-* Automatic sector classification
-* Background pending-order synchronization
-* Multi-user authentication
-* Long-term user memory
-* More specialized financial agents
-* Earnings-analysis agent
-* News-analysis agent
-* Technical-indicator agent
-* Fundamental-analysis agent
-* Portfolio optimization agent
-* Real-time market alerts
-* WhatsApp notifications
-* Production-grade vector database
-* Human-in-the-loop approval for trades
-* Observability and agent tracing
-
-A future architecture could look like:
-
-```text
-                         User
-                           │
-                           ▼
-                     Router Agent
-                           │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-        ▼                  ▼                  ▼
-   Trading Agent     Analysis Agent      Research Agent
-        │                  │                  │
-        ▼                  ▼                  ▼
-   Risk Engine             RAG              Web/News
-        │                  │                  │
-        └──────────────────┼──────────────────┘
-                           ▼
-                     Final Response
-```
+- Metadata fallback so arbitrary filing PDFs can be ingested
+- Ticker picker in the UI for switching between ingested filings
+- Native HTML ingestion of EDGAR filings
+- Hybrid search (BM25 + vectors) before reranking
+- Automatic stock-price retrieval for risk calculations
+- Automatic sector classification
+- Background pending-order synchronisation
+- Multi-user authentication
+- Earnings, news, and technical-indicator agents
+- Portfolio optimisation agent
+- Real-time market alerts
+- Production-grade vector database
+- Observability and agent tracing
+- RAG evaluation (retrieval and generation metrics)
 
 ---
 
 # 📌 Project Goal
 
-The goal of Smart Finance Agent is to demonstrate how **LLMs, tool calling, RAG, multi-agent orchestration, financial databases, risk controls, and external APIs** can be combined into a practical financial AI system.
-
-The project focuses on keeping important financial operations deterministic and controlled while using LLMs for natural-language understanding, routing, reasoning, and user interaction.
+To demonstrate how **LLMs, tool calling, RAG with reranking, multi-agent orchestration, financial databases, risk controls, and external APIs** can be combined into a practical financial AI system, keeping important financial operations deterministic and controlled while using LLMs for understanding, routing, reasoning, and interaction.
 
 ---
 
 # ⚠️ Disclaimer
 
-This project is intended for educational and experimental purposes.
-
-It is **not financial advice**.
+This project is for educational and experimental purposes. It is **not financial advice**.
 
 Trading functionality is designed for **Alpaca paper trading** by default. Enabling live trading introduces financial risk and should only be done after appropriate testing and safeguards.
