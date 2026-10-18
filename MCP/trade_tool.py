@@ -4,6 +4,7 @@ import copy
 import json
 import uuid
 from langchain_core.tools import tool
+from langgraph.types import interrupt
 
 from sql.risk import check_position_risk
 
@@ -14,7 +15,8 @@ def _get_alpaca_tool(tools, name: str):
     return next(t for t in tools if t.name == name)
 
 
-def _record_trade(symbol: str, side: str, quantity: float, price: float, order_id: str = ""):
+def _record_trade(symbol: str, side: str, quantity: float, price: float,
+                   order_id: str = "", sector: str | None = None):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -32,14 +34,20 @@ def _record_trade(symbol: str, side: str, quantity: float, price: float, order_i
             if row:
                 new_qty = row[0] + quantity
                 new_invested = row[1] + total
-                cursor.execute(
-                    "UPDATE holdings SET quantity=?, avg_price=?, total_invested=? WHERE symbol=?",
-                    (new_qty, new_invested / new_qty, new_invested, symbol),
-                )
+                if sector:
+                    cursor.execute(
+                        "UPDATE holdings SET quantity=?, avg_price=?, total_invested=?, sector=? WHERE symbol=?",
+                        (new_qty, new_invested / new_qty, new_invested, sector, symbol),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE holdings SET quantity=?, avg_price=?, total_invested=? WHERE symbol=?",
+                        (new_qty, new_invested / new_qty, new_invested, symbol),
+                    )
             else:
                 cursor.execute(
-                    "INSERT INTO holdings (symbol, quantity, avg_price, total_invested) VALUES (?,?,?,?)",
-                    (symbol, quantity, price, total),
+                    "INSERT INTO holdings (symbol, quantity, avg_price, total_invested, sector) VALUES (?,?,?,?,?)",
+                    (symbol, quantity, price, total, sector),
                 )
             cursor.execute(
                 "INSERT INTO ledger (type, category, amount, description, balance_after) VALUES (?,?,?,?,?)",
@@ -175,13 +183,10 @@ async def _call_alpaca_tool(tool_obj, args: dict) -> dict:
         "id": f"call_{uuid.uuid4().hex[:8]}",
     })
 
-    # Preferred path: structured content from the MCP artifact.
     artifact = getattr(result, "artifact", None)
     if artifact and isinstance(artifact, dict) and artifact.get("structured_content"):
         payload = artifact["structured_content"]
     else:
-        # Fallback: some MCP servers only populate the text content block
-        # with a JSON string. Try to parse that before giving up.
         content = getattr(result, "content", result)
         payload = None
         if isinstance(content, str):
@@ -200,12 +205,8 @@ async def _call_alpaca_tool(tool_obj, args: dict) -> dict:
                         continue
 
         if payload is None:
-            # Nothing usable found - return whatever we got so
-            # _extract_field can at least attempt its old normalization
-            # logic instead of crashing.
             payload = content if isinstance(content, (dict, list)) else {}
 
-    # Unwrap the "data" envelope some MCP servers add around the real order.
     if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
         payload = payload["data"]
 
@@ -236,6 +237,9 @@ def build_trade_tools(alpaca_tools):
         side must be 'buy' or 'sell'. Always use this tool for trading —
         never call place_stock_order directly.
 
+        Both BUY and SELL orders require human approval (a confirmation
+        prompt is shown to the user) before being placed.
+
         Before a BUY, if the position or sector risk limits would be
         breached, this returns status "needs_confirmation" instead of
         placing the order. Only set force=True after the user has
@@ -254,6 +258,7 @@ def build_trade_tools(alpaca_tools):
 
         symbol = symbol.upper().strip()
 
+        # Risk check: buy-side only
         if side == "buy" and not force:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
@@ -271,6 +276,18 @@ def build_trade_tools(alpaca_tools):
                         "message": "This trade breaches your risk limits. Confirm to proceed anyway.",
                     }
 
+        # --- Human-in-the-loop approval: both BUY and SELL ---
+        approval = interrupt({
+            "message": f"Approve this order: {side.upper()} {quantity} {symbol}?",
+            "order": {"symbol": symbol, "side": side, "quantity": quantity},
+        })
+
+        if not approval:
+            return {
+                "status": "rejected",
+                "message": f"{side.capitalize()} order for {quantity} {symbol} was rejected by user.",
+            }
+
         order = await _call_alpaca_tool(place_order, {
             "symbol": symbol,
             "side": side,
@@ -285,9 +302,6 @@ def build_trade_tools(alpaca_tools):
         status = _extract_field(order, "status")
         print("debug", status, order_id, fill_price)
 
-        # Guard: if we still couldn't determine the order_id (e.g. an
-        # unexpected response shape from the MCP server), bail out loudly
-        # instead of silently tracking a pending order under a None key.
         if not order_id:
             return {
                 "status": "error",
@@ -298,7 +312,6 @@ def build_trade_tools(alpaca_tools):
         if status in ("rejected", "canceled", "expired"):
             return {"status": "order_failed", "order_id": order_id, "order_status": status, "raw": order}
 
-        # Market orders can take a moment to fill — poll briefly if not filled yet
         for _ in range(5):
             if fill_price:
                 print("order successfull")
@@ -322,7 +335,7 @@ def build_trade_tools(alpaca_tools):
                 ),
             }
 
-        _record_trade(symbol, side, quantity, float(fill_price), order_id=order_id)
+        _record_trade(symbol, side, quantity, float(fill_price), order_id=order_id, sector=sector)
         return {
             "status": "success",
             "symbol": symbol,
@@ -350,14 +363,14 @@ def build_trade_tools(alpaca_tools):
         filled_qty = _extract_field(order, "filled_qty", "qty")
 
         if status in ("rejected", "canceled", "expired"):
-            _remove_pending_order(order_id)  # nothing more to wait for
+            _remove_pending_order(order_id)
             return {"status": "order_failed", "order_id": order_id, "order_status": status}
 
         if not fill_price:
             return {"status": "still_pending", "order_id": order_id, "order_status": status}
 
         if _order_already_recorded(order_id):
-            _remove_pending_order(order_id)  # stale row cleanup, just in case
+            _remove_pending_order(order_id)
             return {"status": "already_recorded", "order_id": order_id}
 
         _record_trade(

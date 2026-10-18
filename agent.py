@@ -1,11 +1,12 @@
 from typing import TypedDict, List, Annotated, Dict, Any
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.types import Command
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, BaseMessage,SystemMessage
+from langchain_core.messages import HumanMessage, BaseMessage, SystemMessage
 from MCP.mcpclient import get_alpaca_tools
 from sanitizerGemini.gemini_schema_patch import sanitize_tools_for_gemini
 from MCP.trade_tool import build_trade_tools
@@ -42,15 +43,18 @@ load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 
 
-
+# --------------------------------------------------
 # STATE
+# --------------------------------------------------
 
 class State(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
+    needed_agents: List[str]
 
 
-
+# --------------------------------------------------
 # TOOLS
+# --------------------------------------------------
 
 sql_query_tool = next(t for t in sql_tools if t.name == "sql_db_query")
 
@@ -87,13 +91,14 @@ def rag_tool(query: str):
     """Fetch company documents"""
     return {"docs": ["Q2 report", "CEO notes"]}
 
+
 RISK_TOOLS = sanitize_tools_for_gemini([get_portfolio_diversification])
 tools = [erp_tool] + sql_tools + ALPACA_READONLY + TRADE_TOOLS + RISK_TOOLS
 
 
-
-
+# --------------------------------------------------
 # LLM WITH TOOLS BOUND
+# --------------------------------------------------
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite",
@@ -120,53 +125,60 @@ Return a JSON list, e.g. ["analysis_agent", "agent"].
 
 Query: {query}
 """
+
+
 def parse_json_list(text: str):
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return ["agent"]
+
+
 def router_agent(state: State):
+    query = state["messages"][-1].content
+
     response = llm.invoke([
         SystemMessage(content="You are a routing assistant. Return only JSON."),
-        HumanMessage(content=ROUTER_PROMPT.format(query=state["user_query"]))
+        HumanMessage(content=ROUTER_PROMPT.format(query=query))
     ])
-    # parse response.content into a list of needed agents
     needed = parse_json_list(response.content)
     return {"needed_agents": needed}
 
+
 def route_decision(state: State):
-    # This function returns the name of the next node(s) to run
-    return state["needed_agents"]  
+    return state["needed_agents"]
 
 
-
-
-# =====================================================
+# --------------------------------------------------
 # GRAPH BUILD (compiled per-call with a fresh checkpointer connection)
-# =====================================================
+# --------------------------------------------------
+
 def build_graph() -> StateGraph:
     graph = StateGraph(State)
     graph.add_node("agent", agent)
     graph.add_node("tools", tool_node)
-    graph.add_node("analysis_agent",analysis_agent)
+    graph.add_node("analysis_agent", analysis_agent)
     graph.add_node("router_agent", router_agent)
-    graph.add_conditional_edges(
-    "router_agent",
-    route_decision,
-    {
-        "analysis_agent": "analysis_agent",
-        "agent": "agent",
-    }
-)
+    graph.add_edge(START, "agent")
+    #graph.add_conditional_edges(
+     #   "router_agent",
+      #  route_decision,
+       # {
+        #    "analysis_agent": "analysis_agent",
+         #   "agent": "agent",
+        #}
+    #)
     graph.add_conditional_edges(
         "agent",
         tools_condition,
         {"tools": "tools", END: END},
     )
     graph.add_edge("tools", "agent")
+    graph.add_edge("analysis_agent", END)
     return graph
- 
+
 
 graph = build_graph()
-
-
 
 
 def extract_text(content) -> str:
@@ -183,26 +195,67 @@ def extract_text(content) -> str:
     return str(content)
 
 
+# --------------------------------------------------
+# Shared interrupt/result handling
+# --------------------------------------------------
 
+def _handle_result(result: dict):
+    if "__interrupt__" in result:
+        interrupt_obj = result["__interrupt__"][0]
+        return {
+            "status": "interrupted",
+            "payload": interrupt_obj.value,
+        }
+    return {
+        "status": "done",
+        "text": extract_text(result["messages"][-1].content),
+    }
+
+
+# --------------------------------------------------
 # CHAT (with SQLite-backed memory)
+# --------------------------------------------------
 
 async def chat_async(user_message: str, thread_id: str = "default"):
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as checkpointer:
         app = graph.compile(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
         result = await app.ainvoke(
-            {"messages": [HumanMessage(content=user_message)]},
+            {
+                "messages": [HumanMessage(content=user_message)],
+                "needed_agents": [],
+            },
             config=config,
         )
-        return extract_text(result["messages"][-1].content)
+        return _handle_result(result)
 
 
 def chat(user_message: str, thread_id: str = "default"):
     return asyncio.run(chat_async(user_message, thread_id))
 
 
+# --------------------------------------------------
+# RESUME (after human approves/rejects an interrupt)
+# --------------------------------------------------
 
+async def resume_async(resume_value, thread_id: str = "default"):
+    async with AsyncSqliteSaver.from_conn_string(DB_PATH) as checkpointer:
+        app = graph.compile(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+        result = await app.ainvoke(
+            Command(resume=resume_value),
+            config=config,
+        )
+        return _handle_result(result)
+
+
+def resume_chat(resume_value, thread_id: str = "default"):
+    return asyncio.run(resume_async(resume_value, thread_id))
+
+
+# --------------------------------------------------
 # DELETE CHAT HISTORY (removes thread from checkpoints.db)
+# --------------------------------------------------
 
 async def delete_thread_async(thread_id: str):
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as checkpointer:
@@ -213,8 +266,9 @@ def delete_thread(thread_id: str):
     asyncio.run(delete_thread_async(thread_id))
 
 
-
+# --------------------------------------------------
 # LOAD HISTORY (to repopulate Streamlit display after refresh)
+# --------------------------------------------------
 
 async def get_history_async(thread_id: str):
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as checkpointer:

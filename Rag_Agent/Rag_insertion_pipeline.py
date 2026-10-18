@@ -1,5 +1,5 @@
 """
-sec_rag_ingest.py
+Rag_insertion_pipeline.py
 ------------------
 Ingests SEC filings (10-Q / 10-K text, e.g. exported from EDGAR's "View Filing
 Data" viewer) into a vector DB with strong per-company / per-filing metadata
